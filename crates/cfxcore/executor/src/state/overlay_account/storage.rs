@@ -138,6 +138,9 @@ impl OverlayAccount {
         if let Some(entry) = self.storage_write_cache.read().get(key) {
             return Some(*entry);
         }
+        if let Some(entry) = self.storage_committed_cache.read().get(key) {
+            return Some(*entry);
+        }
         if let Some(entry) = self.storage_read_cache.read().get(key) {
             return Some(*entry);
         }
@@ -188,6 +191,10 @@ impl OverlayAccount {
         &self, db: &StateDbGeneric, key: &[u8],
     ) -> DbResult<U256> {
         Ok(self.storage_entry_at(db, key)?.value)
+    }
+
+    pub fn origin_storage_at(&self, key: &[u8]) -> Option<U256> {
+        Some(self.storage_committed_cache.read().get(key)?.value)
     }
 
     // If a contract is removed, and then some one transfer balance to it,
@@ -251,6 +258,10 @@ impl OverlayAccount {
             warn!("Change storage value outside transaction fails: current value is zero, tx {:?}, key {:?}", self.address, key);
         }
         Ok(())
+    }
+
+    pub fn is_warm_storage_entry(&self, key: &[u8]) -> bool {
+        self.storage_write_cache.read().get(key).is_some()
     }
 
     #[cfg(test)]
