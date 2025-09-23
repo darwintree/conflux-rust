@@ -3,6 +3,7 @@ import argparse
 import subprocess
 import os
 import sys
+import time
 from test_utils.test_scheduler import TestScheduler
 from test_framework.test_framework import TEST_EXIT_INTERRUPT
 
@@ -13,6 +14,34 @@ PORT_RANGE = 100
 # 64 to 113 is recommended for user defined error code (https://tldp.org/LDP/abs/html/exitcodes.html). 
 # 64 to 77 has been reserved in /usr/include/sysexits.h (https://stackoverflow.com/questions/1101957/are-there-any-standard-exit-status-codes-in-linux)
 TEST_FAILURE_ERROR_CODE = 80
+
+
+def resolve_test_scripts(specified_tests, test_dir):
+    resolved = []
+    for script in specified_tests:
+        candidate = script.strip()
+        if not candidate:
+            continue
+        if os.path.isabs(candidate):
+            full_path = os.path.abspath(candidate)
+        else:
+            normalized = os.path.normpath(candidate)
+            if normalized.startswith("tests" + os.sep):
+                normalized = normalized[len("tests" + os.sep):]
+            full_path = os.path.abspath(os.path.join(test_dir, normalized))
+
+        try:
+            if os.path.commonpath([full_path, test_dir]) != test_dir:
+                raise ValueError
+        except ValueError:
+            raise ValueError(f"Test script {script} is outside the tests directory")
+
+        if not os.path.isfile(full_path):
+            raise FileNotFoundError(f"Test script {script} not found")
+
+        resolved.append(os.path.relpath(full_path, test_dir))
+    return resolved
+
 
 def run_single_test(py, script, test_dir, index, port_min, port_max, conflux_binary):
     try:
@@ -26,7 +55,7 @@ def run_single_test(py, script, test_dir, index, port_min, port_max, conflux_bin
         CROSS = "x "
         CIRCLE = "o "
 
-    BOLD, BLUE, RED, GREY = ("", ""), ("", ""), ("", ""), ("", "")
+    BOLD, BLUE, RED, GREY, YELLOW = ("", ""), ("", ""), ("", ""), ("", ""), ("", "")
     if os.name == 'posix':
         # primitive formatting on supported
         # terminal via ANSI escape sequences:
@@ -39,21 +68,24 @@ def run_single_test(py, script, test_dir, index, port_min, port_max, conflux_bin
     port_min = port_min + (index * PORT_RANGE) % (port_max - port_min)
     color = BLUE
     glyph = TICK
+    start_time = time.perf_counter()
     try:
         subprocess.check_output(args=[py, script, "--randomseed=1", f"--port-min={port_min}", f"--conflux-binary={conflux_binary}", "--cleanup-on-interrupt"],
                                 stdin=None, cwd=test_dir)
     except subprocess.CalledProcessError as err:
+        elapsed = time.perf_counter() - start_time
         if err.returncode == TEST_EXIT_INTERRUPT:
             color = YELLOW
-            print(color[1] + CIRCLE + " Testcase interrupted " + script + color[0])
+            print(color[1] + CIRCLE + f" Testcase interrupted {script} ({elapsed:.2f}s)" + color[0])
             return
 
         color = RED
         glyph = CROSS
-        print(color[1] + glyph + " Testcase " + script + color[0])
+        print(color[1] + glyph + f" Testcase {script} ({elapsed:.2f}s)" + color[0])
         print("Output of " + script + "\n" + err.output.decode("utf-8"))
         raise err
-    print(color[1] + glyph + " Testcase " + script + color[0])
+    elapsed = time.perf_counter() - start_time
+    print(color[1] + glyph + f" Testcase {script} ({elapsed:.2f}s)" + color[0])
 
 
 def run():
@@ -95,8 +127,29 @@ def run():
             os.path.dirname(os.path.realpath(__file__)),
             "../target/release/conflux"),
         type=str)
+    parser.add_argument(
+        "--tests",
+        dest="tests",
+        nargs="+",
+        action="append",
+        default=None,
+        help="Run only the specified test scripts (paths relative to the tests directory)")
     options = parser.parse_args()
-    
+
+    test_dir = os.path.dirname(os.path.realpath(__file__))
+
+    if options.tests:
+        flattened_tests = []
+        for group in options.tests:
+            flattened_tests.extend(group)
+        try:
+            options.tests = resolve_test_scripts(flattened_tests, test_dir)
+        except (FileNotFoundError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(TEST_FAILURE_ERROR_CODE)
+    else:
+        options.tests = []
+
     if options.max_nodes == 0:
         options.max_nodes = os.cpu_count()
         print(f"Max nodes not specified, using {options.max_nodes} nodes")
@@ -130,11 +183,13 @@ def run():
     sys.exit(TEST_FAILURE_ERROR_CODE)
 
 def run_single_round(options):
-    TEST_SCRIPTS = []
-
     test_dir = os.path.dirname(os.path.realpath(__file__))
+    slow_tests = {"full_node_tests/p2p_era_test.py", "pos/retire_param_hard_fork_test.py"}
 
-    test_subdirs = [
+    if options.tests:
+        scripts_to_run = options.tests
+    else:
+        test_subdirs = [
             "", # include test_dir itself
             "full_node_tests",
             "light",
@@ -142,17 +197,18 @@ def run_single_round(options):
             "pos",
             "pubsub",
             "evm_space",
-            ]
-    slow_tests = {"full_node_tests/p2p_era_test.py", "pos/retire_param_hard_fork_test.py"}
+        ]
 
-    # By default, run all *_test.py files in the specified subfolders.
-    for subdir in test_subdirs:
-        subdir_path = os.path.join(test_dir, subdir)
-        for file in os.listdir(subdir_path):
-            if file.endswith("_test.py"):
-                rel_path = os.path.join(subdir, file)
-                if rel_path not in slow_tests:
-                    TEST_SCRIPTS.append(rel_path)
+        test_scripts = []
+        for subdir in test_subdirs:
+            subdir_path = os.path.join(test_dir, subdir)
+            for file in os.listdir(subdir_path):
+                if file.endswith("_test.py"):
+                    rel_path = os.path.join(subdir, file)
+                    if rel_path not in slow_tests:
+                        test_scripts.append(rel_path)
+
+        scripts_to_run = list(slow_tests) + test_scripts
 
     py = "python3"
     if hasattr(sys, "getwindowsversion"):
@@ -169,7 +225,7 @@ def run_single_round(options):
         conflux_binary=options.conflux,
     )
     
-    failed_tests = scheduler.schedule(list(slow_tests) + TEST_SCRIPTS)
+    failed_tests = scheduler.schedule(scripts_to_run)
     return failed_tests
 
 
